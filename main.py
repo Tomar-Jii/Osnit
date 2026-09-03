@@ -8,7 +8,7 @@ from typing import Any
 
 import duckdb
 import gradio as gr
-import httpx  # <-- added for pinger
+import httpx
 from fastapi import FastAPI, HTTPException, Query, Response
 from pydantic import BaseModel
 
@@ -50,7 +50,7 @@ def _idx_ready(kind: str) -> bool:
 
 def _new_conn() -> duckdb.DuckDBPyConnection:
     con = duckdb.connect()
-    # Vercel fix: set home & extension dir to /tmp
+    # Vercel/Cloud fix: set home & extension dir to /tmp
     con.execute("SET home_directory='/tmp'")
     con.execute("SET extension_directory='/tmp/duckdb_extensions'")
     con.execute("INSTALL parquet; LOAD parquet;")
@@ -130,14 +130,12 @@ def _run_field_search(field: str, value: str, mode: str, limit: int) -> dict:
         elif field == "aadharNumber" and _idx_ready("aadhar"):
             view = "people_aadhar"
         elif field == "otherNumber":
-            # otherNumber not sorted — skip to avoid slow scan
             return {"field": field, "value": value, "mode": mode, "count": 0, "results": []}
         else:
             return {"field": field, "value": value, "mode": mode, "count": 0, "results": []}
         sql = f"SELECT * FROM {view} WHERE {field} = '{v}' LIMIT {limit * DUPLICATE_CAP + 20}"
     elif mode == "contains":
         if field == "name":
-            # Name search not available in remote-only mode
             return {"field": field, "value": value, "mode": mode, "count": 0, "results": []}
         v2 = v.replace("%", r"\%").replace("_", r"\_")
         sql = f"SELECT * FROM people_phone WHERE {field} ILIKE '%{v2}%' ESCAPE '\\' LIMIT {limit * DUPLICATE_CAP + 20}"
@@ -158,12 +156,10 @@ def _unified_search(q: str, limit: int = 10) -> dict:
     if is_num:
         all_rows = []
         searched = []
-        # Phone index first (fast)
         if _idx_ready("phone"):
             r = _run_field_search("phoneNumber", q, "exact", limit)
             all_rows.extend(r["results"])
             searched.append("phoneNumber")
-        # Aadhar index second
         if not all_rows and _idx_ready("aadhar"):
             r = _run_field_search("aadharNumber", q, "exact", limit)
             all_rows.extend(r["results"])
@@ -178,7 +174,7 @@ def _unified_search(q: str, limit: int = 10) -> dict:
 
 
 # ── FastAPI (for API access) ────────────────────────────────────────────────
-fastapi_app = FastAPI(title="ICMR + HITEK Search API")
+fastapi_app = FastAPI(title="Search API")
 
 
 class BatchRequest(BaseModel):
@@ -189,21 +185,24 @@ class BatchRequest(BaseModel):
 @fastapi_app.get("/")
 def root():
     return {
-        "app": "ICMR + HITEK Search API",
+        "app": "Search API",
         "records": 2_504_793_870,
         "indexes": {"phone": _idx_ready("phone"), "aadhar": _idx_ready("aadhar")},
         "index_source": INDEX_SOURCE,
         "columns": SEARCH_FIELDS,
         "docs": "/docs",
-        "developer": "@kzr0x | channel @api_wallah",   # <-- credit added
+        "developer": "Tomar Ji",
     }
 
 
 @fastapi_app.get("/health")
 def health():
-    return {"status": "ok", "raw_database_required": False,
-            "indexes": {"phone": _idx_ready("phone"), "aadhar": _idx_ready("aadhar")},
-            "index_source": INDEX_SOURCE}
+    return {
+        "status": "ok",
+        "raw_database_required": False,
+        "indexes": {"phone": _idx_ready("phone"), "aadhar": _idx_ready("aadhar")},
+        "index_source": INDEX_SOURCE,
+    }
 
 
 @fastapi_app.get("/search")
@@ -223,8 +222,12 @@ async def search(
         data = await loop.run_in_executor(pool, _run_field_search, field, q_val, mode, limit)
     else:
         data = await loop.run_in_executor(pool, _unified_search, q_val, limit)
-    result = {"success": bool(data["count"]), **data, "number": q_val,
-              "total": data["count"]}
+    result = {
+        "success": bool(data["count"]),
+        **data,
+        "number": q_val,
+        "total": data["count"],
+    }
     content = json.dumps(result, indent=2 if pretty else None, ensure_ascii=False)
     return Response(content=content, media_type="application/json")
 
@@ -237,27 +240,35 @@ async def search_parallel(req: BatchRequest):
         raise HTTPException(400, "max 50 queries per batch")
     loop = asyncio.get_running_loop()
     tasks = [
-        loop.run_in_executor(pool, _run_field_search,
-                             item.get("field", "phoneNumber"),
-                             item.get("value", ""),
-                             item.get("mode", "exact"),
-                             int(item.get("limit", req.limit)))
+        loop.run_in_executor(
+            pool,
+            _run_field_search,
+            item.get("field", "phoneNumber"),
+            item.get("value", ""),
+            item.get("mode", "exact"),
+            int(item.get("limit", req.limit)),
+        )
         for item in req.queries
     ]
     results = await asyncio.gather(*tasks)
-    return Response(content=json.dumps({"searches": len(req.queries), "results": list(results)},
-                                       indent=2, ensure_ascii=False),
-                    media_type="application/json")
+    return Response(
+        content=json.dumps(
+            {"searches": len(req.queries), "results": list(results)},
+            indent=2,
+            ensure_ascii=False,
+        ),
+        media_type="application/json",
+    )
 
 
 # ── Pinger (keeps app alive) ──────────────────────────────────────────────
 async def pinger():
     """Ping the /health endpoint every 2 minutes to prevent idle shutdown."""
-    port = os.getenv("PORT", "7860")  # default Gradio port; change if needed
+    port = os.getenv("PORT", "7860")
     url = f"http://localhost:{port}/health"
     async with httpx.AsyncClient(timeout=10) as client:
         while True:
-            await asyncio.sleep(120)  # 2 minutes
+            await asyncio.sleep(120)
             try:
                 resp = await client.get(url)
                 if resp.status_code == 200:
@@ -281,7 +292,6 @@ def format_result(row: dict) -> str:
         val = row.get(field, "")
         if val:
             lines.append(f"**{field}:** {val}")
-    # Connected numbers
     cn = row.get("connected_numbers", [])
     if cn:
         nums = ", ".join(f"{c['field']}={c['value']}" for c in cn)
@@ -292,7 +302,7 @@ def format_result(row: dict) -> str:
 def search_ui(query: str, limit: int) -> str:
     """Main Gradio search function."""
     if not query or not query.strip():
-        return "⚠️ Kuch toh search karo — phone, aadhar, ya name daalo."
+        return "⚠️ Search query khali hai — phone ya related ID daalo."
 
     q = query.strip()
     try:
@@ -305,7 +315,7 @@ def search_ui(query: str, limit: int) -> str:
     searched = ", ".join(data.get("searched_fields", []))
 
     if not results:
-        return f"🔍 **Query:** `{q}`\n**Searched:** {searched}\n\n❌ **No data found** for this number."
+        return f"🔍 **Query:** `{q}`\n**Searched:** {searched}\n\n❌ **No data found**."
 
     header = f"🔍 **Query:** `{q}`  |  **Found:** {count} results  |  **Searched:** {searched}\n\n---\n\n"
     parts = []
@@ -316,22 +326,22 @@ def search_ui(query: str, limit: int) -> str:
 
 def build_ui():
     with gr.Blocks(
-        title="ICMR Search API",
+        title="Search Dashboard",
         theme=gr.themes.Soft(),
         css="""
         .main-title { text-align: center; margin-bottom: 0; }
         .subtitle { text-align: center; color: #666; margin-top: 0; }
-        .footer { text-align: center; color: #888; margin-top: 20px; }
-        """
+        .footer { text-align: center; color: #888; margin-top: 20px; font-weight: 500; }
+        """,
     ) as demo:
-        gr.Markdown("# 🔍 ICMR + HITEK Search API", elem_classes="main-title")
-        gr.Markdown("Search **2.5 billion records** — phone, Aadhaar, name, address & more", elem_classes="subtitle")
+        gr.Markdown("# 🔍 Search Dashboard", elem_classes="main-title")
+        gr.Markdown("Search records by phone or query", elem_classes="subtitle")
 
         with gr.Row():
             with gr.Column(scale=3):
                 query_input = gr.Textbox(
                     label="Search Query",
-                    placeholder="Phone number, Aadhaar, ya name daalo...",
+                    placeholder="Search query daalo...",
                     lines=1,
                 )
             with gr.Column(scale=1):
@@ -358,21 +368,18 @@ def build_ui():
         with gr.Accordion("📡 API Info", open=False):
             gr.Markdown("""
 **Endpoints** (via FastAPI):
-- `GET /search?q=<number>` — Phone/Aadhaar search
-- `GET /search?mobile=<number>` — Phone search (alias)
+- `GET /search?q=<query>` — Unified search
+- `GET /search?mobile=<query>` — Phone search alias
 - `GET /health` — Health check
 - `GET /docs` — Swagger UI
-
-**Source:** [HF Dataset](https://huggingface.co/datasets/Kzr0xx/icrm-hitek-full-db-mixed)
             """)
 
-        # Developer credit footer
         gr.Markdown(
             "---\n"
             "<div class='footer'>"
-            "👨‍💻 **Developer:** @kzr0x  |  📢 **Channel:** @api_wallah"
+            "👨‍💻 **Developer:** Tomar Ji"
             "</div>",
-            elem_classes="footer"
+            elem_classes="footer",
         )
 
     return demo
@@ -381,3 +388,4 @@ def build_ui():
 # ── Mount Gradio on FastAPI ─────────────────────────────────────────────────
 demo = build_ui()
 app = gr.mount_gradio_app(fastapi_app, demo, path="/")
+
