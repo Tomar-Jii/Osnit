@@ -2,7 +2,9 @@ import asyncio
 import glob
 import json
 import os
+import re
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
@@ -20,7 +22,7 @@ HF_INDEX_BASE = os.environ.get(
     "https://huggingface.co/datasets/Kzr0xx/icrm-hitek-full-db-mixed/resolve/main",
 ).rstrip("/")
 INDEX_SOURCE = os.environ.get("ICMR_INDEX_SOURCE", "remote").lower()
-PARALLELISM = int(os.environ.get("ICMR_PARALLEL", "2"))
+PARALLELISM = int(os.environ.get("ICMR_PARALLEL", "4"))
 THREADS_PER_CONN = int(os.environ.get("ICMR_THREADS_PER_CONN", "2"))
 DUPLICATE_CAP = 2
 
@@ -38,11 +40,20 @@ REMOTE_INDEXES = {
     "aadhar": [f"{HF_INDEX_BASE}/idx_aadhar.{i}.parquet" for i in range(7)],
 }
 
+# ── Fast In-Memory Cache & Metrics ──────────────────────────────────────────
+QUERY_CACHE: dict[str, tuple[float, dict]] = {}
+CACHE_TTL = 3600  # 1 hour
+METRICS = {
+    "total_searches": 0,
+    "cache_hits": 0,
+    "start_time": time.time()
+}
+
 # ── DuckDB Connection Pool ──────────────────────────────────────────────────
 _conns: list[duckdb.DuckDBPyConnection] = []
 _conns_lock = threading.Lock()
 _thread_local = threading.local()
-pool = ThreadPoolExecutor(max_workers=PARALLELISM, thread_name_prefix="duck")
+pool = ThreadPoolExecutor(max_workers=PARALLELISM, thread_name_prefix="kalx")
 
 
 def _idx_ready(kind: str) -> bool:
@@ -80,7 +91,17 @@ def _get_conn() -> duckdb.DuckDBPyConnection:
     return _conns[ident]
 
 
-# ── Dedup & Connected Records ───────────────────────────────────────────────
+# ── Dedup & Clean Helpers ───────────────────────────────────────────────────
+def _clean_number(val: str) -> str:
+    """Strip spaces, dashes, +91, and leading zero for accurate index hits."""
+    clean = re.sub(r"\D", "", val.strip())
+    if len(clean) == 12 and clean.startswith("91"):
+        clean = clean[2:]
+    elif len(clean) == 11 and clean.startswith("0"):
+        clean = clean[1:]
+    return clean
+
+
 def _person_key(row: dict) -> tuple:
     ph = (row.get("phoneNumber") or "").strip()
     ad = (row.get("aadharNumber") or "").strip()
@@ -117,7 +138,7 @@ def _cap_duplicates(rows: list[dict]) -> list[dict]:
     return out
 
 
-# ── Search Logic ────────────────────────────────────────────────────────────
+# ── Search Engine Logic ─────────────────────────────────────────────────────
 def _run_field_search(field: str, value: str, mode: str, limit: int) -> dict:
     if field not in SEARCH_FIELDS:
         raise ValueError(f"Unknown field: {field}")
@@ -128,18 +149,11 @@ def _run_field_search(field: str, value: str, mode: str, limit: int) -> dict:
             view = "people_phone"
         elif field == "aadharNumber" and _idx_ready("aadhar"):
             view = "people_aadhar"
-        elif field == "otherNumber":
-            return {"field": field, "value": value, "mode": mode, "count": 0, "results": []}
         else:
             return {"field": field, "value": value, "mode": mode, "count": 0, "results": []}
         sql = f"SELECT * FROM {view} WHERE {field} = '{v}' LIMIT {limit * DUPLICATE_CAP + 20}"
-    elif mode == "contains":
-        if field == "name":
-            return {"field": field, "value": value, "mode": mode, "count": 0, "results": []}
-        v2 = v.replace("%", r"\%").replace("_", r"\_")
-        sql = f"SELECT * FROM people_phone WHERE {field} ILIKE '%{v2}%' ESCAPE '\\' LIMIT {limit * DUPLICATE_CAP + 20}"
     else:
-        raise ValueError(f"Unknown mode: {mode}")
+        return {"field": field, "value": value, "mode": mode, "count": 0, "results": []}
 
     con = _get_conn()
     rows = con.execute(sql).fetchall()
@@ -149,342 +163,234 @@ def _run_field_search(field: str, value: str, mode: str, limit: int) -> dict:
 
 
 def _unified_search(q: str, limit: int = 10) -> dict:
-    q = q.strip()
-    is_num = q.isdigit() and len(q) >= 8
+    raw_q = q.strip()
+    clean_q = _clean_number(raw_q)
+    target = clean_q if clean_q else raw_q
+
+    # Check In-Memory Cache
+    now = time.time()
+    if target in QUERY_CACHE:
+        cache_time, cached_data = QUERY_CACHE[target]
+        if now - cache_time < CACHE_TTL:
+            METRICS["cache_hits"] += 1
+            return cached_data
+
+    METRICS["total_searches"] += 1
+    is_num = target.isdigit() and len(target) >= 8
 
     if is_num:
         all_rows = []
         searched = []
+        # 1. Check Phone Index
         if _idx_ready("phone"):
-            r = _run_field_search("phoneNumber", q, "exact", limit)
+            r = _run_field_search("phoneNumber", target, "exact", limit)
             all_rows.extend(r["results"])
             searched.append("phoneNumber")
+        # 2. Check Aadhaar Index if phone yielded no result
         if not all_rows and _idx_ready("aadhar"):
-            r = _run_field_search("aadharNumber", q, "exact", limit)
+            r = _run_field_search("aadharNumber", target, "exact", limit)
             all_rows.extend(r["results"])
             searched.append("aadharNumber")
+
         all_rows = _cap_duplicates(all_rows)[:limit]
-        return {
-            "query": q, "searched_fields": searched,
-            "count": len(all_rows), "results": all_rows,
+        res = {
+            "query": target,
+            "searched_fields": searched,
+            "count": len(all_rows),
+            "results": all_rows,
+            "cached": False,
         }
-    else:
-        return {"query": q, "searched_fields": [], "count": 0, "results": []}
+        QUERY_CACHE[target] = (now, {**res, "cached": True})
+        return res
+
+    return {"query": target, "searched_fields": [], "count": 0, "results": [], "cached": False}
 
 
-# ── Modern Web Dashboard Template ──────────────────────────────────────────
+# ── Web UI Dashboard ────────────────────────────────────────────────────────
 HTML_DASHBOARD = """<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0">
-  <title>KAL-X Search Intelligence</title>
-  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>KAL-X Intelligence Engine</title>
   <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700&display=swap" rel="stylesheet">
   <style>
     :root {
-      --bg: #0b0f19;
-      --card: #121827;
-      --card-border: #1f293d;
+      --bg: #070a12;
+      --card: #111726;
+      --border: #1e293b;
       --accent: #6366f1;
-      --accent-hover: #4f46e5;
       --accent-glow: rgba(99, 102, 241, 0.25);
       --text: #f8fafc;
-      --text-dim: #94a3b8;
-      --success: #10b981;
+      --dim: #94a3b8;
     }
     * { box-sizing: border-box; margin: 0; padding: 0; font-family: 'Outfit', sans-serif; }
     body { background-color: var(--bg); color: var(--text); min-height: 100vh; display: flex; flex-direction: column; }
-    
-    header {
-      padding: 14px 20px;
-      background: rgba(18, 24, 39, 0.9);
-      backdrop-filter: blur(12px);
-      border-bottom: 1px solid var(--card-border);
-      display: flex;
-      justify-content: space-between;
-      align-items: center;
-      position: sticky;
-      top: 0;
-      z-index: 50;
-    }
-    .brand { display: flex; align-items: center; gap: 10px; }
-    .status-badge {
-      display: flex;
-      align-items: center;
-      gap: 6px;
-      background: rgba(16, 185, 129, 0.1);
-      border: 1px solid rgba(16, 185, 129, 0.3);
-      padding: 4px 10px;
-      border-radius: 20px;
-      font-size: 0.75rem;
-      color: #34d399;
-    }
-    .status-dot { width: 7px; height: 7px; background: #10b981; border-radius: 50%; box-shadow: 0 0 8px #10b981; }
-    .nav-links a { color: var(--text-dim); text-decoration: none; font-size: 0.85rem; margin-left: 14px; transition: 0.2s; }
-    .nav-links a:hover { color: var(--text); }
-
-    .main-container { max-width: 860px; margin: 0 auto; width: 100%; padding: 30px 16px; flex: 1; }
+    header { padding: 14px 24px; background: rgba(17, 23, 38, 0.8); backdrop-filter: blur(10px); border-bottom: 1px solid var(--border); display: flex; justify-content: space-between; align-items: center; position: sticky; top: 0; z-index: 50; }
+    .badge { display: flex; align-items: center; gap: 6px; background: rgba(16, 185, 129, 0.1); border: 1px solid rgba(16, 185, 129, 0.25); color: #34d399; padding: 4px 10px; border-radius: 20px; font-size: 0.75rem; }
+    .dot { width: 7px; height: 7px; background: #10b981; border-radius: 50%; box-shadow: 0 0 8px #10b981; }
+    .nav a { color: var(--dim); text-decoration: none; font-size: 0.85rem; margin-left: 16px; transition: 0.2s; }
+    .nav a:hover { color: #fff; }
+    .main { max-width: 860px; margin: 0 auto; width: 100%; padding: 32px 16px; flex: 1; }
     .hero { text-align: center; margin-bottom: 28px; }
-    .hero h1 { font-size: 1.9rem; font-weight: 700; margin-bottom: 6px; letter-spacing: -0.5px; }
-    .hero p { color: var(--text-dim); font-size: 0.95rem; }
-
-    .search-box {
-      background: var(--card);
-      border: 1px solid var(--card-border);
-      border-radius: 16px;
-      padding: 16px;
-      box-shadow: 0 10px 30px rgba(0,0,0,0.35);
-      margin-bottom: 24px;
-    }
-    .input-row { display: flex; gap: 10px; }
-    .search-input {
-      flex: 1;
-      background: #070a12;
-      border: 1px solid var(--card-border);
-      border-radius: 12px;
-      padding: 13px 16px;
-      color: #fff;
-      font-size: 1rem;
-      outline: none;
-      transition: 0.2s;
-    }
-    .search-input:focus { border-color: var(--accent); box-shadow: 0 0 12px var(--accent-glow); }
-    .limit-select {
-      background: #070a12;
-      border: 1px solid var(--card-border);
-      color: var(--text-dim);
-      border-radius: 12px;
-      padding: 0 12px;
-      font-size: 0.9rem;
-      outline: none;
-    }
-    .search-btn {
-      background: linear-gradient(135deg, var(--accent), var(--accent-hover));
-      border: none;
-      color: #fff;
-      padding: 13px 24px;
-      border-radius: 12px;
-      font-weight: 600;
-      cursor: pointer;
-      display: flex;
-      align-items: center;
-      gap: 6px;
-      font-size: 0.95rem;
-      transition: 0.2s;
-    }
-    .search-btn:active { transform: scale(0.97); }
-
-    .stats-bar {
-      display: flex;
-      justify-content: space-between;
-      color: var(--text-dim);
-      font-size: 0.85rem;
-      margin-bottom: 16px;
-      padding: 0 4px;
-    }
-
-    .results-grid { display: flex; flex-direction: column; gap: 14px; }
-    .card {
-      background: var(--card);
-      border: 1px solid var(--card-border);
-      border-radius: 14px;
-      padding: 18px;
-      transition: 0.2s;
-      position: relative;
-    }
-    .card:hover { border-color: #2e3d5b; transform: translateY(-2px); }
-    .card-title { font-size: 1.15rem; font-weight: 600; color: #fff; margin-bottom: 12px; display: flex; justify-content: space-between; align-items: center; }
-    .copy-btn {
-      background: rgba(255,255,255,0.05);
-      border: 1px solid var(--card-border);
-      color: var(--text-dim);
-      font-size: 0.75rem;
-      padding: 4px 10px;
-      border-radius: 6px;
-      cursor: pointer;
-    }
+    .hero h1 { font-size: 2rem; font-weight: 700; margin-bottom: 8px; }
+    .hero p { color: var(--dim); font-size: 0.95rem; }
+    .search-panel { background: var(--card); border: 1px solid var(--border); border-radius: 16px; padding: 14px; box-shadow: 0 10px 30px rgba(0,0,0,0.4); margin-bottom: 24px; }
+    .search-row { display: flex; gap: 10px; }
+    .input-box { flex: 1; background: #0b0f19; border: 1px solid var(--border); border-radius: 12px; padding: 13px 16px; color: #fff; font-size: 1rem; outline: none; }
+    .input-box:focus { border-color: var(--accent); box-shadow: 0 0 10px var(--accent-glow); }
+    .btn { background: var(--accent); border: none; color: #fff; padding: 13px 24px; border-radius: 12px; font-weight: 600; cursor: pointer; transition: 0.2s; display: flex; align-items: center; gap: 6px; }
+    .btn:active { transform: scale(0.96); }
+    .status-bar { display: flex; justify-content: space-between; color: var(--dim); font-size: 0.85rem; margin-bottom: 16px; padding: 0 4px; }
+    .grid { display: flex; flex-direction: column; gap: 14px; }
+    .card { background: var(--card); border: 1px solid var(--border); border-radius: 14px; padding: 18px; transition: 0.2s; }
+    .card-top { display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px; }
+    .card-title { font-size: 1.15rem; font-weight: 600; color: #fff; }
+    .copy-btn { background: rgba(255,255,255,0.06); border: 1px solid var(--border); color: var(--dim); font-size: 0.75rem; padding: 4px 10px; border-radius: 6px; cursor: pointer; }
     .copy-btn:hover { color: #fff; border-color: var(--accent); }
-    
-    .data-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 10px 16px; font-size: 0.88rem; }
-    .data-item { display: flex; flex-direction: column; }
-    .data-item label { color: var(--text-dim); font-size: 0.72rem; text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 2px; }
-    .data-item span { color: #e2e8f0; word-break: break-word; font-weight: 500; }
-
-    .badge-chip {
-      display: inline-block;
-      background: rgba(99, 102, 241, 0.15);
-      color: #a5b4fc;
-      padding: 3px 8px;
-      border-radius: 6px;
-      font-size: 0.78rem;
-      margin-right: 6px;
-      margin-top: 4px;
-    }
-
-    .loader { text-align: center; padding: 40px; color: var(--text-dim); display: none; }
-    .spinner {
-      width: 36px; height: 36px; border: 3px solid rgba(255,255,255,0.1); border-top-color: var(--accent);
-      border-radius: 50%; animation: spin 0.8s linear infinite; margin: 0 auto 12px;
-    }
+    .fields { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 10px 16px; font-size: 0.88rem; }
+    .item label { color: var(--dim); font-size: 0.72rem; text-transform: uppercase; display: block; margin-bottom: 2px; }
+    .item span { color: #e2e8f0; font-weight: 500; word-break: break-word; }
+    .badge-chip { display: inline-block; background: rgba(99, 102, 241, 0.15); color: #a5b4fc; padding: 3px 8px; border-radius: 6px; font-size: 0.78rem; margin: 4px 6px 0 0; }
+    .loader { text-align: center; padding: 40px; color: var(--dim); display: none; }
+    .spinner { width: 34px; height: 34px; border: 3px solid rgba(255,255,255,0.1); border-top-color: var(--accent); border-radius: 50%; animation: spin 0.8s linear infinite; margin: 0 auto 12px; }
     @keyframes spin { to { transform: rotate(360deg); } }
-
-    footer {
-      text-align: center;
-      padding: 22px;
-      color: #64748b;
-      font-size: 0.85rem;
-      border-top: 1px solid var(--card-border);
-      background: #080b13;
-    }
+    footer { text-align: center; padding: 22px; color: #64748b; font-size: 0.85rem; border-top: 1px solid var(--border); }
     footer b { color: #cbd5e1; }
   </style>
 </head>
 <body>
   <header>
-    <div class="brand">
-      <h2 style="font-size: 1.1rem; letter-spacing: 0.5px;">KAL-X <span style="color:var(--accent);">SEARCH</span></h2>
-      <div class="status-badge"><div class="status-dot"></div> Remote Ready</div>
+    <div style="display:flex; align-items:center; gap:10px;">
+      <h2 style="font-size:1.1rem;">KAL-X <span style="color:var(--accent);">INTELLIGENCE</span></h2>
+      <div class="badge"><div class="dot"></div> Online</div>
     </div>
-    <div class="nav-links">
-      <a href="/docs">Swagger Docs</a>
+    <div class="nav">
+      <a href="/docs">Docs</a>
+      <a href="/metrics">Metrics</a>
       <a href="/health">Health</a>
     </div>
   </header>
 
-  <div class="main-container">
+  <div class="main">
     <div class="hero">
-      <h1>Intelligence Database Lookup</h1>
-      <p>Search over <b>2.5 Billion</b> records across phone numbers and identity indexes.</p>
+      <h1>Distributed Database Lookup</h1>
+      <p>Scan <b>2.5+ Billion</b> records across distributed Parquet indexes.</p>
     </div>
 
-    <div class="search-box">
-      <div class="input-row">
-        <input type="text" id="searchInput" class="search-input" placeholder="Enter Phone Number or Search Query..." autofocus onkeydown="if(event.key==='Enter') executeSearch()">
-        <select id="limitSelect" class="limit-select">
-          <option value="5">5 Results</option>
-          <option value="10" selected>10 Results</option>
-          <option value="25">25 Results</option>
-        </select>
-        <button class="search-btn" onclick="executeSearch()">🔍 Search</button>
+    <div class="search-panel">
+      <div class="search-row">
+        <input type="text" id="qInput" class="input-box" placeholder="Phone number ya identifier enter karein..." onkeydown="if(event.key==='Enter') runLookup()">
+        <button class="btn" onclick="runLookup()">🔍 Search</button>
       </div>
     </div>
 
-    <div id="statsBar" class="stats-bar" style="display: none;">
-      <span id="statsQuery">Query: -</span>
-      <span id="statsCount">Found: 0</span>
+    <div id="statusInfo" class="status-bar" style="display:none;">
+      <span id="labelQuery"></span>
+      <span id="labelFound"></span>
     </div>
 
     <div id="loader" class="loader">
       <div class="spinner"></div>
-      Searching distributed parquet index...
+      Querying remote Parquet nodes...
     </div>
 
-    <div id="resultsGrid" class="results-grid"></div>
+    <div id="outputGrid" class="grid"></div>
   </div>
 
   <footer>
-    👨‍💻 Developed by <b>Tomar Ji</b> | Powered by DuckDB & FastAPI
+    👨‍💻 Developed by <b>Tomar Ji</b> | Distributed Parquet Engine
   </footer>
 
   <script>
-    async function executeSearch() {
-      const q = document.getElementById('searchInput').value.trim();
-      const limit = document.getElementById('limitSelect').value;
-      if (!q) return;
+    async function runLookup() {
+      const val = document.getElementById('qInput').value.trim();
+      if (!val) return;
 
       const loader = document.getElementById('loader');
-      const resultsGrid = document.getElementById('resultsGrid');
-      const statsBar = document.getElementById('statsBar');
-      const statsQuery = document.getElementById('statsQuery');
-      const statsCount = document.getElementById('statsCount');
+      const grid = document.getElementById('outputGrid');
+      const statusBar = document.getElementById('statusInfo');
+      const labelQuery = document.getElementById('labelQuery');
+      const labelFound = document.getElementById('labelFound');
 
-      resultsGrid.innerHTML = '';
+      grid.innerHTML = '';
       loader.style.display = 'block';
-      statsBar.style.display = 'none';
+      statusBar.style.display = 'none';
 
       try {
-        const res = await fetch(`/search?q=${encodeURIComponent(q)}&limit=${limit}&pretty=true`);
+        const res = await fetch(`/search?q=${encodeURIComponent(val)}&limit=10`);
         const data = await res.json();
         loader.style.display = 'none';
 
-        statsBar.style.display = 'flex';
-        statsQuery.innerText = `Query: ${q}`;
-        statsCount.innerText = `Found: ${data.count || 0} results`;
+        statusBar.style.display = 'flex';
+        labelQuery.innerText = `Query: ${data.number || val} ${data.cached ? '⚡ (Cached)' : ''}`;
+        labelFound.innerText = `Found: ${data.total || 0} records`;
 
         if (!data.results || data.results.length === 0) {
-          resultsGrid.innerHTML = `
-            <div class="card" style="text-align: center; color: var(--text-dim); padding: 30px;">
-              ❌ Koi record nahi mila is query ke liye.
-            </div>`;
+          grid.innerHTML = `<div class="card" style="text-align:center; color:var(--dim);">❌ No records found for this query.</div>`;
           return;
         }
 
-        data.results.forEach((item, index) => {
+        data.results.forEach((row, i) => {
           const card = document.createElement('div');
           card.className = 'card';
 
-          let connectedHtml = '';
-          if (item.connected_numbers && item.connected_numbers.length > 0) {
-            connectedHtml = `
-              <div style="margin-top: 12px;">
-                <label style="color: var(--text-dim); font-size: 0.72rem; text-transform: uppercase;">Connected Numbers</label>
-                <div>${item.connected_numbers.map(c => `<span class="badge-chip">${c.field}: ${c.value}</span>`).join('')}</div>
-              </div>`;
+          let connHtml = '';
+          if (row.connected_numbers && row.connected_numbers.length > 0) {
+            connHtml = `<div style="margin-top:12px;"><label style="color:var(--dim); font-size:0.72rem; text-transform:uppercase;">Connected</label><div>${row.connected_numbers.map(c => `<span class="badge-chip">${c.field}: ${c.value}</span>`).join('')}</div></div>`;
           }
 
           card.innerHTML = `
-            <div class="card-title">
-              <span>#${index + 1} ${item.name || 'Unknown Name'}</span>
-              <button class="copy-btn" onclick="copyCardData(this, ${JSON.stringify(JSON.stringify(item))})">📋 Copy</button>
+            <div class="card-top">
+              <span class="card-title">#${i+1} ${row.name || 'Unknown Name'}</span>
+              <button class="copy-btn" onclick="copyRecord(this, ${JSON.stringify(JSON.stringify(row))})">📋 Copy</button>
             </div>
-            <div class="data-grid">
-              ${item.fathersName ? `<div class="data-item"><label>Father's Name</label><span>${item.fathersName}</span></div>` : ''}
-              ${item.phoneNumber ? `<div class="data-item"><label>Phone Number</label><span style="color:#38bdf8;">${item.phoneNumber}</span></div>` : ''}
-              ${item.aadharNumber ? `<div class="data-item"><label>Aadhaar</label><span>${item.aadharNumber}</span></div>` : ''}
-              ${item.address ? `<div class="data-item"><label>Address</label><span>${item.address}</span></div>` : ''}
-              ${item.district ? `<div class="data-item"><label>District</label><span>${item.district}</span></div>` : ''}
-              ${item.state ? `<div class="data-item"><label>State</label><span>${item.state}</span></div>` : ''}
-              ${item.pincode ? `<div class="data-item"><label>Pincode</label><span>${item.pincode}</span></div>` : ''}
-              ${item.source ? `<div class="data-item"><label>Source</label><span>${item.source}</span></div>` : ''}
+            <div class="fields">
+              ${row.fathersName ? `<div class="item"><label>Father</label><span>${row.fathersName}</span></div>` : ''}
+              ${row.phoneNumber ? `<div class="item"><label>Phone</label><span style="color:#38bdf8;">${row.phoneNumber}</span></div>` : ''}
+              ${row.address ? `<div class="item"><label>Address</label><span>${row.address}</span></div>` : ''}
+              ${row.district ? `<div class="item"><label>District</label><span>${row.district}</span></div>` : ''}
+              ${row.state ? `<div class="item"><label>State</label><span>${row.state}</span></div>` : ''}
+              ${row.pincode ? `<div class="item"><label>Pincode</label><span>${row.pincode}</span></div>` : ''}
+              ${row.source ? `<div class="item"><label>Source</label><span>${row.source}</span></div>` : ''}
             </div>
-            ${connectedHtml}
+            ${connHtml}
           `;
-          resultsGrid.appendChild(card);
+          grid.appendChild(card);
         });
-
       } catch (err) {
         loader.style.display = 'none';
-        resultsGrid.innerHTML = `
-          <div class="card" style="text-align: center; color: #ef4444; padding: 30px;">
-            ⚠️ Query fail ho gayi ya server response time out ho gaya. Thodi der baad try karein.
-          </div>`;
+        grid.innerHTML = `<div class="card" style="text-align:center; color:#ef4444;">⚠️ Network error ya query timeout. Dubara koshish karein.</div>`;
       }
     }
 
-    function copyCardData(btn, jsonStr) {
+    function copyRecord(btn, jsonStr) {
       const data = JSON.parse(jsonStr);
       let text = '';
       for (const [k, v] of Object.entries(data)) {
         if (v && typeof v !== 'object') text += `${k}: ${v}\\n`;
       }
       navigator.clipboard.writeText(text);
-      const old = btn.innerText;
       btn.innerText = '✅ Copied!';
-      setTimeout(() => btn.innerText = old, 1500);
+      setTimeout(() => btn.innerText = '📋 Copy', 1500);
     }
   </script>
 </body>
 </html>
 """
 
-# ── FastAPI (for API & UI access) ───────────────────────────────────────────
-fastapi_app = FastAPI(title="Search API")
+# ── FastAPI Routes ──────────────────────────────────────────────────────────
+fastapi_app = FastAPI(title="KAL-X Search API", version="2.5.0")
 
 
 class BatchRequest(BaseModel):
     queries: list[dict[str, Any]]
     limit: int = 10
+
+
+class BulkScanRequest(BaseModel):
+    numbers: list[str]
+    limit_per_query: int = 5
 
 
 @fastapi_app.get("/", response_class=HTMLResponse)
@@ -493,13 +399,12 @@ def root(request: Request):
     if "application/json" in accept and "text/html" not in accept:
         return Response(
             content=json.dumps({
-                "app": "Search API",
+                "app": "KAL-X Search Intelligence API",
+                "version": "2.5.0",
                 "records": 2_504_793_870,
                 "indexes": {"phone": _idx_ready("phone"), "aadhar": _idx_ready("aadhar")},
-                "index_source": INDEX_SOURCE,
-                "columns": SEARCH_FIELDS,
-                "docs": "/docs",
                 "developer": "Tomar Ji",
+                "endpoints": ["/search", "/search/bulk", "/export", "/metrics", "/health", "/docs"]
             }, indent=2),
             media_type="application/json"
         )
@@ -510,9 +415,20 @@ def root(request: Request):
 def health():
     return {
         "status": "ok",
-        "raw_database_required": False,
         "indexes": {"phone": _idx_ready("phone"), "aadhar": _idx_ready("aadhar")},
-        "index_source": INDEX_SOURCE,
+        "developer": "Tomar Ji",
+    }
+
+
+@fastapi_app.get("/metrics")
+def metrics():
+    uptime = round(time.time() - METRICS["start_time"], 2)
+    return {
+        "uptime_seconds": uptime,
+        "total_searches": METRICS["total_searches"],
+        "cache_hits": METRICS["cache_hits"],
+        "cached_queries_count": len(QUERY_CACHE),
+        "developer": "Tomar Ji"
     }
 
 
@@ -527,67 +443,68 @@ async def search(
 ):
     q_val = (q or mobile or "").strip()
     if not q_val:
-        raise HTTPException(422, "Provide q or mobile")
+        raise HTTPException(422, "Provide query via ?q= or ?mobile=")
     loop = asyncio.get_running_loop()
     if field:
         data = await loop.run_in_executor(pool, _run_field_search, field, q_val, mode, limit)
     else:
         data = await loop.run_in_executor(pool, _unified_search, q_val, limit)
+
     result = {
-        "success": bool(data["count"]),
+        "success": bool(data.get("count", 0)),
         **data,
         "number": q_val,
-        "total": data["count"],
+        "total": data.get("count", 0),
+        "developer": "Tomar Ji"
     }
     content = json.dumps(result, indent=2 if pretty else None, ensure_ascii=False)
     return Response(content=content, media_type="application/json")
 
 
-@fastapi_app.post("/search/parallel")
-async def search_parallel(req: BatchRequest):
-    if not req.queries:
-        raise HTTPException(400, "queries must not be empty")
-    if len(req.queries) > 50:
-        raise HTTPException(400, "max 50 queries per batch")
+@fastapi_app.post("/search/bulk")
+async def bulk_search(req: BulkScanRequest):
+    """Scan multiple identifiers concurrently (max 20 per request)."""
+    if not req.numbers:
+        raise HTTPException(400, "Numbers list cannot be empty.")
+    clean_list = req.numbers[:20]
+
     loop = asyncio.get_running_loop()
     tasks = [
-        loop.run_in_executor(
-            pool,
-            _run_field_search,
-            item.get("field", "phoneNumber"),
-            item.get("value", ""),
-            item.get("mode", "exact"),
-            int(item.get("limit", req.limit)),
-        )
-        for item in req.queries
+        loop.run_in_executor(pool, _unified_search, num, req.limit_per_query)
+        for num in clean_list
     ]
     results = await asyncio.gather(*tasks)
+    return {
+        "developer": "Tomar Ji",
+        "scanned_count": len(clean_list),
+        "results": {num: res for num, res in zip(clean_list, results)}
+    }
+
+
+@fastapi_app.get("/export")
+async def export_data(q: str = Query(...)):
+    """Export single search record directly as a downloadable JSON document."""
+    loop = asyncio.get_running_loop()
+    data = await loop.run_in_executor(pool, _unified_search, q, 50)
+    json_bytes = json.dumps(data, indent=2, ensure_ascii=False)
     return Response(
-        content=json.dumps(
-            {"searches": len(req.queries), "results": list(results)},
-            indent=2,
-            ensure_ascii=False,
-        ),
+        content=json_bytes,
         media_type="application/json",
+        headers={"Content-Disposition": f"attachment; filename=export_{_clean_number(q)}.json"}
     )
 
 
-# ── Pinger (keeps app alive) ──────────────────────────────────────────────
+# ── Background Keep-Alive ───────────────────────────────────────────────────
 async def pinger():
-    """Ping the /health endpoint every 2 minutes to prevent idle shutdown."""
     port = os.getenv("PORT", "7860")
     url = f"http://localhost:{port}/health"
     async with httpx.AsyncClient(timeout=10) as client:
         while True:
             await asyncio.sleep(120)
             try:
-                resp = await client.get(url)
-                if resp.status_code == 200:
-                    print(f"[Pinger] OK at {asyncio.get_event_loop().time()}")
-                else:
-                    print(f"[Pinger] Unexpected status: {resp.status_code}")
-            except Exception as e:
-                print(f"[Pinger] Error: {e}")
+                await client.get(url)
+            except Exception:
+                pass
 
 
 @fastapi_app.on_event("startup")
@@ -595,55 +512,4 @@ async def startup_event():
     asyncio.create_task(pinger())
 
 
-# ── Gradio UI Fallback (Available at /gradio) ───────────────────────────────
-def format_result(row: dict) -> str:
-    lines = []
-    for field in SEARCH_FIELDS:
-        val = row.get(field, "")
-        if val:
-            lines.append(f"**{field}:** {val}")
-    cn = row.get("connected_numbers", [])
-    if cn:
-        nums = ", ".join(f"{c['field']}={c['value']}" for c in cn)
-        lines.append(f"**connected:** {nums}")
-    return "\n\n".join(lines)
-
-
-def search_ui(query: str, limit: int) -> str:
-    if not query or not query.strip():
-        return "⚠️ Search query khali hai."
-    q = query.strip()
-    try:
-        data = _unified_search(q, int(limit))
-    except Exception as e:
-        return f"❌ Error: {str(e)}"
-    count = data["count"]
-    results = data["results"]
-    searched = ", ".join(data.get("searched_fields", []))
-    if not results:
-        return f"🔍 **Query:** `{q}`\n**Searched:** {searched}\n\n❌ **No data found**."
-    header = f"🔍 **Query:** `{q}`  |  **Found:** {count} results  |  **Searched:** {searched}\n\n---\n\n"
-    parts = []
-    for i, row in enumerate(results, 1):
-        parts.append(f"### Result {i}\n{format_result(row)}")
-    return header + "\n\n---\n\n".join(parts)
-
-
-def build_ui():
-    with gr.Blocks(title="Search Dashboard", theme=gr.themes.Soft()) as demo:
-        gr.Markdown("# 🔍 Search Dashboard")
-        with gr.Row():
-            with gr.Column(scale=3):
-                query_input = gr.Textbox(label="Search Query", lines=1)
-            with gr.Column(scale=1):
-                limit_slider = gr.Slider(minimum=1, maximum=50, value=10, step=1, label="Max Results")
-        search_btn = gr.Button("🔍 Search", variant="primary")
-        output = gr.Markdown(label="Results")
-        search_btn.click(fn=search_ui, inputs=[query_input, limit_slider], outputs=output)
-        query_input.submit(fn=search_ui, inputs=[query_input, limit_slider], outputs=output)
-        gr.Markdown("---\n**Developer:** Tomar Ji")
-    return demo
-
-
-demo = build_ui()
-app = gr.mount_gradio_app(fastapi_app, demo, path="/gradio")
+app = fastapi_app
