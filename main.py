@@ -9,7 +9,8 @@ from typing import Any
 import duckdb
 import gradio as gr
 import httpx
-from fastapi import FastAPI, HTTPException, Query, Response
+from fastapi import FastAPI, HTTPException, Query, Request, Response
+from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 
 # ── Config ──────────────────────────────────────────────────────────────────
@@ -50,12 +51,10 @@ def _idx_ready(kind: str) -> bool:
 
 def _new_conn() -> duckdb.DuckDBPyConnection:
     con = duckdb.connect()
-    # Vercel/Cloud fix: set home & extension dir to /tmp
     con.execute("SET home_directory='/tmp'")
     con.execute("SET extension_directory='/tmp/duckdb_extensions'")
     con.execute("INSTALL parquet; LOAD parquet;")
     con.execute("INSTALL httpfs; LOAD httpfs;")
-    # Create sorted index views from remote HF parts
     for kind, urls in REMOTE_INDEXES.items():
         view = f"people_{kind}"
         lst = ", ".join(f"'{u}'" for u in urls)
@@ -173,7 +172,313 @@ def _unified_search(q: str, limit: int = 10) -> dict:
         return {"query": q, "searched_fields": [], "count": 0, "results": []}
 
 
-# ── FastAPI (for API access) ────────────────────────────────────────────────
+# ── Modern Web Dashboard Template ──────────────────────────────────────────
+HTML_DASHBOARD = """<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0">
+  <title>KAL-X Search Intelligence</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+  <style>
+    :root {
+      --bg: #0b0f19;
+      --card: #121827;
+      --card-border: #1f293d;
+      --accent: #6366f1;
+      --accent-hover: #4f46e5;
+      --accent-glow: rgba(99, 102, 241, 0.25);
+      --text: #f8fafc;
+      --text-dim: #94a3b8;
+      --success: #10b981;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; font-family: 'Outfit', sans-serif; }
+    body { background-color: var(--bg); color: var(--text); min-height: 100vh; display: flex; flex-direction: column; }
+    
+    header {
+      padding: 14px 20px;
+      background: rgba(18, 24, 39, 0.9);
+      backdrop-filter: blur(12px);
+      border-bottom: 1px solid var(--card-border);
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      position: sticky;
+      top: 0;
+      z-index: 50;
+    }
+    .brand { display: flex; align-items: center; gap: 10px; }
+    .status-badge {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      background: rgba(16, 185, 129, 0.1);
+      border: 1px solid rgba(16, 185, 129, 0.3);
+      padding: 4px 10px;
+      border-radius: 20px;
+      font-size: 0.75rem;
+      color: #34d399;
+    }
+    .status-dot { width: 7px; height: 7px; background: #10b981; border-radius: 50%; box-shadow: 0 0 8px #10b981; }
+    .nav-links a { color: var(--text-dim); text-decoration: none; font-size: 0.85rem; margin-left: 14px; transition: 0.2s; }
+    .nav-links a:hover { color: var(--text); }
+
+    .main-container { max-width: 860px; margin: 0 auto; width: 100%; padding: 30px 16px; flex: 1; }
+    .hero { text-align: center; margin-bottom: 28px; }
+    .hero h1 { font-size: 1.9rem; font-weight: 700; margin-bottom: 6px; letter-spacing: -0.5px; }
+    .hero p { color: var(--text-dim); font-size: 0.95rem; }
+
+    .search-box {
+      background: var(--card);
+      border: 1px solid var(--card-border);
+      border-radius: 16px;
+      padding: 16px;
+      box-shadow: 0 10px 30px rgba(0,0,0,0.35);
+      margin-bottom: 24px;
+    }
+    .input-row { display: flex; gap: 10px; }
+    .search-input {
+      flex: 1;
+      background: #070a12;
+      border: 1px solid var(--card-border);
+      border-radius: 12px;
+      padding: 13px 16px;
+      color: #fff;
+      font-size: 1rem;
+      outline: none;
+      transition: 0.2s;
+    }
+    .search-input:focus { border-color: var(--accent); box-shadow: 0 0 12px var(--accent-glow); }
+    .limit-select {
+      background: #070a12;
+      border: 1px solid var(--card-border);
+      color: var(--text-dim);
+      border-radius: 12px;
+      padding: 0 12px;
+      font-size: 0.9rem;
+      outline: none;
+    }
+    .search-btn {
+      background: linear-gradient(135deg, var(--accent), var(--accent-hover));
+      border: none;
+      color: #fff;
+      padding: 13px 24px;
+      border-radius: 12px;
+      font-weight: 600;
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      font-size: 0.95rem;
+      transition: 0.2s;
+    }
+    .search-btn:active { transform: scale(0.97); }
+
+    .stats-bar {
+      display: flex;
+      justify-content: space-between;
+      color: var(--text-dim);
+      font-size: 0.85rem;
+      margin-bottom: 16px;
+      padding: 0 4px;
+    }
+
+    .results-grid { display: flex; flex-direction: column; gap: 14px; }
+    .card {
+      background: var(--card);
+      border: 1px solid var(--card-border);
+      border-radius: 14px;
+      padding: 18px;
+      transition: 0.2s;
+      position: relative;
+    }
+    .card:hover { border-color: #2e3d5b; transform: translateY(-2px); }
+    .card-title { font-size: 1.15rem; font-weight: 600; color: #fff; margin-bottom: 12px; display: flex; justify-content: space-between; align-items: center; }
+    .copy-btn {
+      background: rgba(255,255,255,0.05);
+      border: 1px solid var(--card-border);
+      color: var(--text-dim);
+      font-size: 0.75rem;
+      padding: 4px 10px;
+      border-radius: 6px;
+      cursor: pointer;
+    }
+    .copy-btn:hover { color: #fff; border-color: var(--accent); }
+    
+    .data-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 10px 16px; font-size: 0.88rem; }
+    .data-item { display: flex; flex-direction: column; }
+    .data-item label { color: var(--text-dim); font-size: 0.72rem; text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 2px; }
+    .data-item span { color: #e2e8f0; word-break: break-word; font-weight: 500; }
+
+    .badge-chip {
+      display: inline-block;
+      background: rgba(99, 102, 241, 0.15);
+      color: #a5b4fc;
+      padding: 3px 8px;
+      border-radius: 6px;
+      font-size: 0.78rem;
+      margin-right: 6px;
+      margin-top: 4px;
+    }
+
+    .loader { text-align: center; padding: 40px; color: var(--text-dim); display: none; }
+    .spinner {
+      width: 36px; height: 36px; border: 3px solid rgba(255,255,255,0.1); border-top-color: var(--accent);
+      border-radius: 50%; animation: spin 0.8s linear infinite; margin: 0 auto 12px;
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
+
+    footer {
+      text-align: center;
+      padding: 22px;
+      color: #64748b;
+      font-size: 0.85rem;
+      border-top: 1px solid var(--card-border);
+      background: #080b13;
+    }
+    footer b { color: #cbd5e1; }
+  </style>
+</head>
+<body>
+  <header>
+    <div class="brand">
+      <h2 style="font-size: 1.1rem; letter-spacing: 0.5px;">KAL-X <span style="color:var(--accent);">SEARCH</span></h2>
+      <div class="status-badge"><div class="status-dot"></div> Remote Ready</div>
+    </div>
+    <div class="nav-links">
+      <a href="/docs">Swagger Docs</a>
+      <a href="/health">Health</a>
+    </div>
+  </header>
+
+  <div class="main-container">
+    <div class="hero">
+      <h1>Intelligence Database Lookup</h1>
+      <p>Search over <b>2.5 Billion</b> records across phone numbers and identity indexes.</p>
+    </div>
+
+    <div class="search-box">
+      <div class="input-row">
+        <input type="text" id="searchInput" class="search-input" placeholder="Enter Phone Number or Search Query..." autofocus onkeydown="if(event.key==='Enter') executeSearch()">
+        <select id="limitSelect" class="limit-select">
+          <option value="5">5 Results</option>
+          <option value="10" selected>10 Results</option>
+          <option value="25">25 Results</option>
+        </select>
+        <button class="search-btn" onclick="executeSearch()">🔍 Search</button>
+      </div>
+    </div>
+
+    <div id="statsBar" class="stats-bar" style="display: none;">
+      <span id="statsQuery">Query: -</span>
+      <span id="statsCount">Found: 0</span>
+    </div>
+
+    <div id="loader" class="loader">
+      <div class="spinner"></div>
+      Searching distributed parquet index...
+    </div>
+
+    <div id="resultsGrid" class="results-grid"></div>
+  </div>
+
+  <footer>
+    👨‍💻 Developed by <b>Tomar Ji</b> | Powered by DuckDB & FastAPI
+  </footer>
+
+  <script>
+    async function executeSearch() {
+      const q = document.getElementById('searchInput').value.trim();
+      const limit = document.getElementById('limitSelect').value;
+      if (!q) return;
+
+      const loader = document.getElementById('loader');
+      const resultsGrid = document.getElementById('resultsGrid');
+      const statsBar = document.getElementById('statsBar');
+      const statsQuery = document.getElementById('statsQuery');
+      const statsCount = document.getElementById('statsCount');
+
+      resultsGrid.innerHTML = '';
+      loader.style.display = 'block';
+      statsBar.style.display = 'none';
+
+      try {
+        const res = await fetch(`/search?q=${encodeURIComponent(q)}&limit=${limit}&pretty=true`);
+        const data = await res.json();
+        loader.style.display = 'none';
+
+        statsBar.style.display = 'flex';
+        statsQuery.innerText = `Query: ${q}`;
+        statsCount.innerText = `Found: ${data.count || 0} results`;
+
+        if (!data.results || data.results.length === 0) {
+          resultsGrid.innerHTML = `
+            <div class="card" style="text-align: center; color: var(--text-dim); padding: 30px;">
+              ❌ Koi record nahi mila is query ke liye.
+            </div>`;
+          return;
+        }
+
+        data.results.forEach((item, index) => {
+          const card = document.createElement('div');
+          card.className = 'card';
+
+          let connectedHtml = '';
+          if (item.connected_numbers && item.connected_numbers.length > 0) {
+            connectedHtml = `
+              <div style="margin-top: 12px;">
+                <label style="color: var(--text-dim); font-size: 0.72rem; text-transform: uppercase;">Connected Numbers</label>
+                <div>${item.connected_numbers.map(c => `<span class="badge-chip">${c.field}: ${c.value}</span>`).join('')}</div>
+              </div>`;
+          }
+
+          card.innerHTML = `
+            <div class="card-title">
+              <span>#${index + 1} ${item.name || 'Unknown Name'}</span>
+              <button class="copy-btn" onclick="copyCardData(this, ${JSON.stringify(JSON.stringify(item))})">📋 Copy</button>
+            </div>
+            <div class="data-grid">
+              ${item.fathersName ? `<div class="data-item"><label>Father's Name</label><span>${item.fathersName}</span></div>` : ''}
+              ${item.phoneNumber ? `<div class="data-item"><label>Phone Number</label><span style="color:#38bdf8;">${item.phoneNumber}</span></div>` : ''}
+              ${item.aadharNumber ? `<div class="data-item"><label>Aadhaar</label><span>${item.aadharNumber}</span></div>` : ''}
+              ${item.address ? `<div class="data-item"><label>Address</label><span>${item.address}</span></div>` : ''}
+              ${item.district ? `<div class="data-item"><label>District</label><span>${item.district}</span></div>` : ''}
+              ${item.state ? `<div class="data-item"><label>State</label><span>${item.state}</span></div>` : ''}
+              ${item.pincode ? `<div class="data-item"><label>Pincode</label><span>${item.pincode}</span></div>` : ''}
+              ${item.source ? `<div class="data-item"><label>Source</label><span>${item.source}</span></div>` : ''}
+            </div>
+            ${connectedHtml}
+          `;
+          resultsGrid.appendChild(card);
+        });
+
+      } catch (err) {
+        loader.style.display = 'none';
+        resultsGrid.innerHTML = `
+          <div class="card" style="text-align: center; color: #ef4444; padding: 30px;">
+            ⚠️ Query fail ho gayi ya server response time out ho gaya. Thodi der baad try karein.
+          </div>`;
+      }
+    }
+
+    function copyCardData(btn, jsonStr) {
+      const data = JSON.parse(jsonStr);
+      let text = '';
+      for (const [k, v] of Object.entries(data)) {
+        if (v && typeof v !== 'object') text += `${k}: ${v}\\n`;
+      }
+      navigator.clipboard.writeText(text);
+      const old = btn.innerText;
+      btn.innerText = '✅ Copied!';
+      setTimeout(() => btn.innerText = old, 1500);
+    }
+  </script>
+</body>
+</html>
+"""
+
+# ── FastAPI (for API & UI access) ───────────────────────────────────────────
 fastapi_app = FastAPI(title="Search API")
 
 
@@ -182,17 +487,23 @@ class BatchRequest(BaseModel):
     limit: int = 10
 
 
-@fastapi_app.get("/")
-def root():
-    return {
-        "app": "Search API",
-        "records": 2_504_793_870,
-        "indexes": {"phone": _idx_ready("phone"), "aadhar": _idx_ready("aadhar")},
-        "index_source": INDEX_SOURCE,
-        "columns": SEARCH_FIELDS,
-        "docs": "/docs",
-        "developer": "Tomar Ji",
-    }
+@fastapi_app.get("/", response_class=HTMLResponse)
+def root(request: Request):
+    accept = request.headers.get("accept", "")
+    if "application/json" in accept and "text/html" not in accept:
+        return Response(
+            content=json.dumps({
+                "app": "Search API",
+                "records": 2_504_793_870,
+                "indexes": {"phone": _idx_ready("phone"), "aadhar": _idx_ready("aadhar")},
+                "index_source": INDEX_SOURCE,
+                "columns": SEARCH_FIELDS,
+                "docs": "/docs",
+                "developer": "Tomar Ji",
+            }, indent=2),
+            media_type="application/json"
+        )
+    return HTML_DASHBOARD
 
 
 @fastapi_app.get("/health")
@@ -284,9 +595,8 @@ async def startup_event():
     asyncio.create_task(pinger())
 
 
-# ── Gradio UI ───────────────────────────────────────────────────────────────
+# ── Gradio UI Fallback (Available at /gradio) ───────────────────────────────
 def format_result(row: dict) -> str:
-    """Format a single result record as readable text."""
     lines = []
     for field in SEARCH_FIELDS:
         val = row.get(field, "")
@@ -300,23 +610,18 @@ def format_result(row: dict) -> str:
 
 
 def search_ui(query: str, limit: int) -> str:
-    """Main Gradio search function."""
     if not query or not query.strip():
-        return "⚠️ Search query khali hai — phone ya related ID daalo."
-
+        return "⚠️ Search query khali hai."
     q = query.strip()
     try:
         data = _unified_search(q, int(limit))
     except Exception as e:
         return f"❌ Error: {str(e)}"
-
     count = data["count"]
     results = data["results"]
     searched = ", ".join(data.get("searched_fields", []))
-
     if not results:
         return f"🔍 **Query:** `{q}`\n**Searched:** {searched}\n\n❌ **No data found**."
-
     header = f"🔍 **Query:** `{q}`  |  **Found:** {count} results  |  **Searched:** {searched}\n\n---\n\n"
     parts = []
     for i, row in enumerate(results, 1):
@@ -325,67 +630,20 @@ def search_ui(query: str, limit: int) -> str:
 
 
 def build_ui():
-    with gr.Blocks(
-        title="Search Dashboard",
-        theme=gr.themes.Soft(),
-        css="""
-        .main-title { text-align: center; margin-bottom: 0; }
-        .subtitle { text-align: center; color: #666; margin-top: 0; }
-        .footer { text-align: center; color: #888; margin-top: 20px; font-weight: 500; }
-        """,
-    ) as demo:
-        gr.Markdown("# 🔍 Search Dashboard", elem_classes="main-title")
-        gr.Markdown("Search records by phone or query", elem_classes="subtitle")
-
+    with gr.Blocks(title="Search Dashboard", theme=gr.themes.Soft()) as demo:
+        gr.Markdown("# 🔍 Search Dashboard")
         with gr.Row():
             with gr.Column(scale=3):
-                query_input = gr.Textbox(
-                    label="Search Query",
-                    placeholder="Search query daalo...",
-                    lines=1,
-                )
+                query_input = gr.Textbox(label="Search Query", lines=1)
             with gr.Column(scale=1):
-                limit_slider = gr.Slider(
-                    minimum=1, maximum=50, value=10, step=1,
-                    label="Max Results",
-                )
-
-        search_btn = gr.Button("🔍 Search", variant="primary", size="lg")
+                limit_slider = gr.Slider(minimum=1, maximum=50, value=10, step=1, label="Max Results")
+        search_btn = gr.Button("🔍 Search", variant="primary")
         output = gr.Markdown(label="Results")
-
-        search_btn.click(
-            fn=search_ui,
-            inputs=[query_input, limit_slider],
-            outputs=output,
-        )
-        query_input.submit(
-            fn=search_ui,
-            inputs=[query_input, limit_slider],
-            outputs=output,
-        )
-
-        gr.Markdown("---")
-        with gr.Accordion("📡 API Info", open=False):
-            gr.Markdown("""
-**Endpoints** (via FastAPI):
-- `GET /search?q=<query>` — Unified search
-- `GET /search?mobile=<query>` — Phone search alias
-- `GET /health` — Health check
-- `GET /docs` — Swagger UI
-            """)
-
-        gr.Markdown(
-            "---\n"
-            "<div class='footer'>"
-            "👨‍💻 **Developer:** Tomar Ji"
-            "</div>",
-            elem_classes="footer",
-        )
-
+        search_btn.click(fn=search_ui, inputs=[query_input, limit_slider], outputs=output)
+        query_input.submit(fn=search_ui, inputs=[query_input, limit_slider], outputs=output)
+        gr.Markdown("---\n**Developer:** Tomar Ji")
     return demo
 
 
-# ── Mount Gradio on FastAPI ─────────────────────────────────────────────────
 demo = build_ui()
-app = gr.mount_gradio_app(fastapi_app, demo, path="/")
-
+app = gr.mount_gradio_app(fastapi_app, demo, path="/gradio")
