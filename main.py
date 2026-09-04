@@ -26,6 +26,11 @@ PARALLELISM = int(os.environ.get("ICMR_PARALLEL", "4"))
 THREADS_PER_CONN = int(os.environ.get("ICMR_THREADS_PER_CONN", "2"))
 DUPLICATE_CAP = 2
 
+# Blacklist numbers (Inka data search me kabhi show nahi hoga)
+BLACKLISTED_NUMBERS = {
+    "9926888306",
+}
+
 SEARCH_FIELDS = [
     "name", "fathersName", "phoneNumber", "aadharNumber", "otherNumber",
     "address", "district", "pincode", "state", "town", "source",
@@ -42,7 +47,7 @@ REMOTE_INDEXES = {
 
 # ── Fast In-Memory Cache & Metrics ──────────────────────────────────────────
 QUERY_CACHE: dict[str, tuple[float, dict]] = {}
-CACHE_TTL = 3600  # 1 hour
+CACHE_TTL = 3600
 METRICS = {
     "total_searches": 0,
     "cache_hits": 0,
@@ -91,9 +96,8 @@ def _get_conn() -> duckdb.DuckDBPyConnection:
     return _conns[ident]
 
 
-# ── Dedup & Clean Helpers ───────────────────────────────────────────────────
+# ── Clean & Helper Functions ────────────────────────────────────────────────
 def _clean_number(val: str) -> str:
-    """Strip spaces, dashes, +91, and leading zero for accurate index hits."""
     clean = re.sub(r"\D", "", val.strip())
     if len(clean) == 12 and clean.startswith("91"):
         clean = clean[2:]
@@ -142,6 +146,12 @@ def _cap_duplicates(rows: list[dict]) -> list[dict]:
 def _run_field_search(field: str, value: str, mode: str, limit: int) -> dict:
     if field not in SEARCH_FIELDS:
         raise ValueError(f"Unknown field: {field}")
+    
+    # Blacklist check
+    clean_val = _clean_number(value)
+    if clean_val in BLACKLISTED_NUMBERS or value.strip() in BLACKLISTED_NUMBERS:
+        return {"field": field, "value": value, "mode": mode, "count": 0, "results": []}
+
     v = value.replace("'", "''")
 
     if mode == "exact":
@@ -159,13 +169,26 @@ def _run_field_search(field: str, value: str, mode: str, limit: int) -> dict:
     rows = con.execute(sql).fetchall()
     cols = [d[0] for d in con.description]
     results = _cap_duplicates([dict(zip(cols, r)) for r in rows])[:limit]
-    return {"field": field, "value": value, "mode": mode, "count": len(results), "results": results}
+    
+    # Filter blacklisted numbers from connected results
+    filtered_results = []
+    for row in results:
+        ph = _clean_number(str(row.get("phoneNumber") or ""))
+        if ph in BLACKLISTED_NUMBERS:
+            continue
+        filtered_results.append(row)
+
+    return {"field": field, "value": value, "mode": mode, "count": len(filtered_results), "results": filtered_results}
 
 
 def _unified_search(q: str, limit: int = 10) -> dict:
     raw_q = q.strip()
     clean_q = _clean_number(raw_q)
     target = clean_q if clean_q else raw_q
+
+    # Blacklist check (Instant empty response)
+    if clean_q in BLACKLISTED_NUMBERS or raw_q in BLACKLISTED_NUMBERS:
+        return {"query": target, "searched_fields": [], "count": 0, "results": [], "cached": False}
 
     # Check In-Memory Cache
     now = time.time()
@@ -181,23 +204,28 @@ def _unified_search(q: str, limit: int = 10) -> dict:
     if is_num:
         all_rows = []
         searched = []
-        # 1. Check Phone Index
         if _idx_ready("phone"):
             r = _run_field_search("phoneNumber", target, "exact", limit)
             all_rows.extend(r["results"])
             searched.append("phoneNumber")
-        # 2. Check Aadhaar Index if phone yielded no result
         if not all_rows and _idx_ready("aadhar"):
             r = _run_field_search("aadharNumber", target, "exact", limit)
             all_rows.extend(r["results"])
             searched.append("aadharNumber")
 
-        all_rows = _cap_duplicates(all_rows)[:limit]
+        # Double check output rows
+        safe_rows = []
+        for r in all_rows:
+            ph = _clean_number(str(r.get("phoneNumber") or ""))
+            if ph not in BLACKLISTED_NUMBERS:
+                safe_rows.append(r)
+
+        safe_rows = _cap_duplicates(safe_rows)[:limit]
         res = {
             "query": target,
             "searched_fields": searched,
-            "count": len(all_rows),
-            "results": all_rows,
+            "count": len(safe_rows),
+            "results": safe_rows,
             "cached": False,
         }
         QUERY_CACHE[target] = (now, {**res, "cached": True})
@@ -206,13 +234,13 @@ def _unified_search(q: str, limit: int = 10) -> dict:
     return {"query": target, "searched_fields": [], "count": 0, "results": [], "cached": False}
 
 
-# ── Web UI Dashboard ────────────────────────────────────────────────────────
+# ── Web Dashboard Template ──────────────────────────────────────────────────
 HTML_DASHBOARD = """<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>KAL-X Intelligence Engine</title>
+  <title>KAL-X Search Intelligence</title>
   <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700&display=swap" rel="stylesheet">
   <style>
     :root {
@@ -239,7 +267,7 @@ HTML_DASHBOARD = """<!DOCTYPE html>
     .search-row { display: flex; gap: 10px; }
     .input-box { flex: 1; background: #0b0f19; border: 1px solid var(--border); border-radius: 12px; padding: 13px 16px; color: #fff; font-size: 1rem; outline: none; }
     .input-box:focus { border-color: var(--accent); box-shadow: 0 0 10px var(--accent-glow); }
-    .btn { background: var(--accent); border: none; color: #fff; padding: 13px 24px; border-radius: 12px; font-weight: 600; cursor: pointer; transition: 0.2s; display: flex; align-items: center; gap: 6px; }
+    .btn { background: var(--accent); border: none; color: #fff; padding: 13px 24px; border-radius: 12px; font-weight: 600; cursor: pointer; transition: 0.2s; }
     .btn:active { transform: scale(0.96); }
     .status-bar { display: flex; justify-content: space-between; color: var(--dim); font-size: 0.85rem; margin-bottom: 16px; padding: 0 4px; }
     .grid { display: flex; flex-direction: column; gap: 14px; }
@@ -247,7 +275,6 @@ HTML_DASHBOARD = """<!DOCTYPE html>
     .card-top { display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px; }
     .card-title { font-size: 1.15rem; font-weight: 600; color: #fff; }
     .copy-btn { background: rgba(255,255,255,0.06); border: 1px solid var(--border); color: var(--dim); font-size: 0.75rem; padding: 4px 10px; border-radius: 6px; cursor: pointer; }
-    .copy-btn:hover { color: #fff; border-color: var(--accent); }
     .fields { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 10px 16px; font-size: 0.88rem; }
     .item label { color: var(--dim); font-size: 0.72rem; text-transform: uppercase; display: block; margin-bottom: 2px; }
     .item span { color: #e2e8f0; font-weight: 500; word-break: break-word; }
@@ -262,7 +289,7 @@ HTML_DASHBOARD = """<!DOCTYPE html>
 <body>
   <header>
     <div style="display:flex; align-items:center; gap:10px;">
-      <h2 style="font-size:1.1rem;">KAL-X <span style="color:var(--accent);">INTELLIGENCE</span></h2>
+      <h2 style="font-size:1.1rem;">KAL-X <span style="color:var(--accent);">SEARCH</span></h2>
       <div class="badge"><div class="dot"></div> Online</div>
     </div>
     <div class="nav">
@@ -274,8 +301,8 @@ HTML_DASHBOARD = """<!DOCTYPE html>
 
   <div class="main">
     <div class="hero">
-      <h1>Distributed Database Lookup</h1>
-      <p>Scan <b>2.5+ Billion</b> records across distributed Parquet indexes.</p>
+      <h1>Intelligence Database Lookup</h1>
+      <p>Search over <b>2.5 Billion</b> records across phone and identity indexes.</p>
     </div>
 
     <div class="search-panel">
@@ -292,7 +319,7 @@ HTML_DASHBOARD = """<!DOCTYPE html>
 
     <div id="loader" class="loader">
       <div class="spinner"></div>
-      Querying remote Parquet nodes...
+      Searching distributed parquet index...
     </div>
 
     <div id="outputGrid" class="grid"></div>
@@ -360,7 +387,7 @@ HTML_DASHBOARD = """<!DOCTYPE html>
         });
       } catch (err) {
         loader.style.display = 'none';
-        grid.innerHTML = `<div class="card" style="text-align:center; color:#ef4444;">⚠️ Network error ya query timeout. Dubara koshish karein.</div>`;
+        grid.innerHTML = `<div class="card" style="text-align:center; color:#ef4444;">⚠️ Query timeout. Dubara try karein.</div>`;
       }
     }
 
@@ -463,7 +490,6 @@ async def search(
 
 @fastapi_app.post("/search/bulk")
 async def bulk_search(req: BulkScanRequest):
-    """Scan multiple identifiers concurrently (max 20 per request)."""
     if not req.numbers:
         raise HTTPException(400, "Numbers list cannot be empty.")
     clean_list = req.numbers[:20]
@@ -483,7 +509,6 @@ async def bulk_search(req: BulkScanRequest):
 
 @fastapi_app.get("/export")
 async def export_data(q: str = Query(...)):
-    """Export single search record directly as a downloadable JSON document."""
     loop = asyncio.get_running_loop()
     data = await loop.run_in_executor(pool, _unified_search, q, 50)
     json_bytes = json.dumps(data, indent=2, ensure_ascii=False)
